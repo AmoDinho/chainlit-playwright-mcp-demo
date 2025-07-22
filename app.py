@@ -190,16 +190,33 @@ async def on_message(message: cl.Message):
                     # Call the tool
                     tool_result = await call_tool(tool_use)
                     
+                    # Check if the tool result indicates an error
+                    is_error = False
+                    result_content = str(tool_result)
+                    
+                    # Handle MCP result format
+                    if hasattr(tool_result, 'isError') and tool_result.isError:
+                        is_error = True
+                        logger.warning(f"Tool {tool_call['function']['name']} returned error: {result_content}")
+                    elif "Error:" in result_content or "net::ERR" in result_content:
+                        is_error = True
+                        logger.warning(f"Tool {tool_call['function']['name']} failed: {result_content}")
+                    else:
+                        logger.info(f"Tool {tool_call['function']['name']} executed successfully")
+                    
                     # Add tool result to message history
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call["id"],
-                        "content": str(tool_result)
+                        "content": result_content
                     }
                     message_history.append(tool_message)
                     
-                    # Show tool result to user
-                    await cl.Message(content=f"🔧 Tool '{tool_call['function']['name']}' executed successfully").send()
+                    # Show appropriate user message
+                    if is_error:
+                        await cl.Message(content=f"⚠️ Tool '{tool_call['function']['name']}' encountered an error").send()
+                    else:
+                        await cl.Message(content=f"🔧 Tool '{tool_call['function']['name']}' executed successfully").send()
                     
                 except Exception as e:
                     logger.error(f"Error executing tool {tool_call['function']['name']}: {str(e)}")
@@ -210,23 +227,109 @@ async def on_message(message: cl.Message):
                         "content": f"Error: {str(e)}"
                     }
                     message_history.append(error_message)
+                    await cl.Message(content=f"❌ Tool '{tool_call['function']['name']}' failed with exception").send()
             
-            # Make another API call to get the final response
+            # Make another API call to get the final response (keep tools available for additional calls)
             logger.info("Making follow-up API call after tool execution...")
             follow_up_stream = await client.chat.completions.create(
                 messages=message_history,
                 stream=True,
-                **{k: v for k, v in settings.items() if k != 'tools'}  # Remove tools for follow-up
+                tools=openai_tools if openai_tools else None,  # Keep tools available
+                **settings
             )
+            
+            # Handle potential additional tool calls in the follow-up
+            follow_up_tool_calls = {}
+            follow_up_current_tool_call_id = None
             
             # Stream the final response
             final_msg = cl.Message(content="")
             async for part in follow_up_stream:
+                # Handle text content
                 if content := part.choices[0].delta.content:
                     await final_msg.stream_token(content)
+                
+                # Handle additional tool calls
+                if tool_calls_delta := part.choices[0].delta.tool_calls:
+                    for tool_call in tool_calls_delta:
+                        if tool_call.id:
+                            # New tool call
+                            follow_up_current_tool_call_id = tool_call.id
+                            follow_up_tool_calls[follow_up_current_tool_call_id] = {
+                                "id": tool_call.id,
+                                "type": tool_call.type,
+                                "function": {
+                                    "name": tool_call.function.name if tool_call.function.name else "",
+                                    "arguments": tool_call.function.arguments if tool_call.function.arguments else ""
+                                }
+                            }
+                        else:
+                            # Continue existing tool call
+                            if follow_up_current_tool_call_id and tool_call.function.arguments:
+                                follow_up_tool_calls[follow_up_current_tool_call_id]["function"]["arguments"] += tool_call.function.arguments
             
-            message_history.append({"role": "assistant", "content": final_msg.content})
-            await final_msg.update()
+            # If there are additional tool calls, execute them recursively
+            if follow_up_tool_calls:
+                logger.info(f"Processing {len(follow_up_tool_calls)} additional tool call(s)")
+                # Add assistant message with new tool calls
+                assistant_follow_up = {"role": "assistant", "content": final_msg.content, "tool_calls": list(follow_up_tool_calls.values())}
+                message_history.append(assistant_follow_up)
+                
+                # Execute additional tools (similar logic as before)
+                for tool_call in follow_up_tool_calls.values():
+                    try:
+                        logger.info(f"Executing additional tool: {tool_call['function']['name']}")
+                        tool_args = json.loads(tool_call["function"]["arguments"])
+                        tool_use = ToolUse(tool_call["function"]["name"], tool_args)
+                        tool_result = await call_tool(tool_use)
+                        
+                        # Check for errors
+                        is_error = False
+                        result_content = str(tool_result)
+                        if hasattr(tool_result, 'isError') and tool_result.isError:
+                            is_error = True
+                            logger.warning(f"Additional tool {tool_call['function']['name']} returned error")
+                        
+                        tool_message = {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": result_content
+                        }
+                        message_history.append(tool_message)
+                        
+                        if is_error:
+                            await cl.Message(content=f"⚠️ Additional tool '{tool_call['function']['name']}' encountered an error").send()
+                        else:
+                            await cl.Message(content=f"🔧 Additional tool '{tool_call['function']['name']}' executed successfully").send()
+                        
+                    except Exception as e:
+                        logger.error(f"Error executing additional tool {tool_call['function']['name']}: {str(e)}")
+                        error_message = {
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "content": f"Error: {str(e)}"
+                        }
+                        message_history.append(error_message)
+                
+                # Final API call for the ultimate response
+                logger.info("Making final API call after additional tool execution...")
+                final_stream = await client.chat.completions.create(
+                    messages=message_history,
+                    stream=True,
+                    **{k: v for k, v in settings.items()}  # No more tools this time
+                )
+                
+                ultimate_msg = cl.Message(content="")
+                async for part in final_stream:
+                    if content := part.choices[0].delta.content:
+                        await ultimate_msg.stream_token(content)
+                
+                message_history.append({"role": "assistant", "content": ultimate_msg.content})
+                await ultimate_msg.update()
+            else:
+                # No additional tool calls, just regular response
+                message_history.append({"role": "assistant", "content": final_msg.content})
+                await final_msg.update()
         else:
             # No tool calls, just add the regular response
             message_history.append(assistant_message)
@@ -311,12 +414,27 @@ async def call_tool(tool_use):
         result = await mcp_session.call_tool(tool_name, tool_input)
         
         print(f"Result: {result}")
-        logger.info(f"MCP tool {tool_name} executed successfully")
+        
+        # Log based on whether it's an error or success
+        if hasattr(result, 'isError') and result.isError:
+            logger.warning(f"MCP tool {tool_name} returned error result")
+        else:
+            logger.info(f"MCP tool {tool_name} executed successfully")
+            
         return result
         
     except Exception as e:
         logger.error(f"Error calling MCP tool {tool_name}: {str(e)}", exc_info=True)
-        raise
+        # Return a structured error that the caller can detect
+        class ErrorResult:
+            def __init__(self, error_msg):
+                self.isError = True
+                self.content = [{"type": "text", "text": f"Error: {error_msg}"}]
+            
+            def __str__(self):
+                return f"Error: {self.content[0]['text'] if self.content else 'Unknown error'}"
+        
+        return ErrorResult(str(e))
     
 @cl.on_mcp_disconnect
 async def on_mcp_disconnect(name: str, session: ClientSession):
