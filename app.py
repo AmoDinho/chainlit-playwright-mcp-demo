@@ -4,6 +4,7 @@ import json, os, asyncio, logging
 from dotenv import load_dotenv
 import sys
 from datetime import datetime
+from mcp import ClientSession
 
 # Configure logging
 def setup_logging():
@@ -98,6 +99,10 @@ async def on_message(message: cl.Message):
         logger.info("Making OpenAI API call...")
         start_time = datetime.now()
         
+        mcp_tools = cl.user_session.get("mcp_tools", {})
+        all_tools = [tool for connection_tools in mcp_tools.values() for tool in connection_tools]
+        message_history.append({"role": "tool", "content": json.dumps(all_tools)})
+
         # Create message for streaming response
         msg = cl.Message(content="")
         
@@ -105,6 +110,7 @@ async def on_message(message: cl.Message):
         stream = await client.chat.completions.create(
             messages=message_history, 
             stream=True, 
+            tools=all_tools,
             **settings
         )
         
@@ -135,3 +141,45 @@ async def on_message(message: cl.Message):
 async def on_chat_end():
     """Log when a chat session ends"""
     logger.info("Chat session ended")
+
+@cl.on_mcp_connect
+async def on_mcp_connect(connection, session: ClientSession):
+    """Called when an MCP connection is established"""
+    # Your connection initialization code here
+    # This handler is required for MCP to work
+    # List available tools
+    result = await session.list_tools()
+    
+    # Process tool metadata
+    tools = [{
+        "name": t.name,
+        "description": t.description,
+        "input_schema": t.inputSchema,
+    } for t in result.tools]
+    
+    # Store tools for later use
+    mcp_tools = cl.user_session.get("mcp_tools", {})
+    mcp_tools[connection.name] = tools
+    cl.user_session.set("mcp_tools", mcp_tools)
+
+@cl.step(type="tool") 
+async def call_tool(tool_use):
+    tool_name = tool_use.name
+    tool_input = tool_use.input
+    
+    # Find appropriate MCP connection for this tool
+    mcp_name = find_mcp_for_tool(tool_name)
+    
+    # Get the MCP session
+    mcp_session, _ = cl.context.session.mcp_sessions.get(mcp_name)
+    
+    # Call the tool
+    result = await mcp_session.call_tool(tool_name, tool_input)
+    
+    return result
+    
+@cl.on_mcp_disconnect
+async def on_mcp_disconnect(name: str, session: ClientSession):
+    """Called when an MCP connection is terminated"""
+    # Your cleanup code here
+    # This handler is optional
