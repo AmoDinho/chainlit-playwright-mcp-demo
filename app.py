@@ -3,6 +3,7 @@ import chainlit as cl
 import json, os, asyncio, logging
 from dotenv import load_dotenv
 import sys
+import traceback
 from datetime import datetime
 from mcp import ClientSession
 
@@ -86,263 +87,330 @@ async def start_chat():
     # Initialize empty MCP tools dictionary
     cl.user_session.set("mcp_tools", {})
 
+@cl.on_mcp_connect
+async def on_mcp_connect(connection, session: ClientSession):
+    """Called when an MCP connection is established"""
+    logger.info(f"MCP connection established: {connection.name}")
+    
+    await cl.Message(
+        content=f"Establishing connection with MCP server: `{connection.name}`..."
+    ).send()
+    
+    try:
+        # List available tools
+        result = await session.list_tools()
+        
+        if result and hasattr(result, "tools") and result.tools:
+            # Process tool metadata in OpenAI function format
+            tools_for_llm = []
+            for tool in result.tools:
+                tools_for_llm.append({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.inputSchema,
+                    },
+                })
+            
+            # Store tools for later use
+            mcp_tools = cl.user_session.get("mcp_tools", {})
+            mcp_tools[connection.name] = tools_for_llm
+            cl.user_session.set("mcp_tools", mcp_tools)
+            
+            tool_names = [tool.name for tool in result.tools]
+            
+            await cl.Message(
+                content=f"**Tools available from `{connection.name}`:**\n{', '.join(tool_names)}"
+            ).send()
+            
+            logger.info(f"Loaded {len(tools_for_llm)} tools from {connection.name}: {tool_names}")
+            
+            # Auto-execute run-me-first if available
+            if "run-me-first" in tool_names:
+                try:
+                    logger.info("Auto-executing 'run-me-first' tool")
+                    auto_result = await session.call_tool("run-me-first", {})
+                    
+                    if isinstance(auto_result, dict):
+                        result_text = json.dumps(auto_result)
+                    elif hasattr(auto_result, "content") and auto_result.content:
+                        result_text = "".join(
+                            getattr(block, "text", "") for block in auto_result.content
+                        )
+                    else:
+                        result_text = str(auto_result)
+                    
+                    await cl.Message(
+                        content=f"**Setup Complete**: {result_text}"
+                    ).send()
+                    logger.info("Successfully auto-executed 'run-me-first'")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to auto-execute 'run-me-first': {str(e)}")
+                    await cl.Message(
+                        content=f"⚠️ Setup tool failed to run automatically: {str(e)}"
+                    ).send()
+        
+    except Exception as e:
+        logger.error(f"Error connecting to MCP {connection.name}: {str(e)}", exc_info=True)
+        await cl.Message(
+            content=f"⚠️ Failed to connect to MCP server {connection.name}: {str(e)}"
+        ).send()
+
+@cl.on_mcp_disconnect
+async def on_mcp_disconnect(name: str, session: ClientSession):
+    """Called when an MCP connection is terminated"""
+    logger.info(f"MCP connection disconnected: {name}")
+    
+    await cl.Message(f"MCP connection `{name}` has been disconnected.").send()
+    
+    # Remove tools from session
+    mcp_tools = cl.user_session.get("mcp_tools", {})
+    if name in mcp_tools:
+        removed_tools = len(mcp_tools[name])
+        del mcp_tools[name]
+        cl.user_session.set("mcp_tools", mcp_tools)
+        logger.info(f"Removed {removed_tools} tools from disconnected MCP: {name}")
+
+async def execute_mcp_tool(tool_call, all_mcp_tools):
+    """
+    Execute any MCP tool with proper error handling and UI feedback.
+    Returns (tool_result_text, tool_step_output)
+    """
+    tool_name = tool_call.function.name
+    tool_args = json.loads(tool_call.function.arguments)
+    
+    async with cl.Step(name=tool_name, type="tool", show_input="json") as tool_step:
+        tool_step.input = tool_args
+        
+        try:
+            logger.info(f"Executing MCP tool: {tool_name}")
+            
+            # Find which MCP connection has this tool
+            mcp_connection_name = next(
+                (
+                    conn_name
+                    for conn_name, tools in all_mcp_tools.items()
+                    if any(t["function"]["name"] == tool_name for t in tools)
+                ),
+                None,
+            )
+            
+            if not mcp_connection_name:
+                raise Exception(f"Tool '{tool_name}' not found in any MCP connection")
+            
+            # Get the MCP session
+            mcp_session, _ = cl.context.session.mcp_sessions.get(mcp_connection_name)
+            if not mcp_session:
+                raise Exception(f"MCP session for '{mcp_connection_name}' not found")
+            
+            # Set timeout based on tool type
+            timeout_seconds = 60.0
+            
+            # Execute the tool with timeout
+            tool_task = mcp_session.call_tool(tool_name, tool_args)
+            result = await asyncio.wait_for(tool_task, timeout=timeout_seconds)
+            
+            # Process the result
+            if isinstance(result, dict):
+                tool_result = json.dumps(result)
+            elif hasattr(result, "content") and result.content:
+                tool_result = "".join(getattr(block, "text", "") for block in result.content)
+            else:
+                tool_result = str(result)
+            
+            tool_step.output = tool_result
+            logger.info(f"MCP tool {tool_name} executed successfully")
+            
+            return tool_result, tool_result
+            
+        except asyncio.TimeoutError:
+            error_msg = f"Tool '{tool_name}' timed out after {timeout_seconds} seconds"
+            logger.error(error_msg)
+            tool_step.error = error_msg
+            return error_msg, error_msg
+        except Exception as e:
+            error_msg = f"Error executing tool '{tool_name}': {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            tool_step.error = error_msg
+            return error_msg, error_msg
+
+async def continue_conversation(history, aggregated_tools, max_iterations=5):
+    """
+    Continue the conversation with tool calling support, handling multiple iterations
+    """
+    iteration = 0
+    
+    while iteration < max_iterations:
+        iteration += 1
+        logger.info(f"Starting conversation iteration {iteration}")
+        
+        try:
+            # Get AI response
+            async with cl.Step(
+                name=f"Thinking (iteration {iteration})", type="llm"
+            ) as step:
+                response = await client.chat.completions.create(
+                    model=settings["model"],
+                    messages=history,
+                    tools=aggregated_tools if aggregated_tools else None,
+                    tool_choice="auto" if aggregated_tools else None,
+                    temperature=settings["temperature"],
+                    max_tokens=settings["max_tokens"]
+                )
+                response_message = response.choices[0].message
+                step.output = response_message
+            
+            if response_message.tool_calls:
+                logger.info(f"Processing {len(response_message.tool_calls)} tool call(s)")
+                
+                # Add assistant message with tool calls to history
+                history.append({
+                    "role": "assistant",
+                    "content": response_message.content,
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                        for tool_call in response_message.tool_calls
+                    ],
+                })
+                
+                # Execute all tool calls
+                all_mcp_tools = cl.user_session.get("mcp_tools", {})
+                for tool_call in response_message.tool_calls:
+                    tool_result_text, _ = await execute_mcp_tool(tool_call, all_mcp_tools)
+                    
+                    # Add tool result to history
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": str(tool_result_text),
+                    })
+                
+                cl.user_session.set("message_history", history)
+                continue  # Continue the conversation loop
+                
+            else:
+                # No more tool calls, provide final response
+                if response_message.content:
+                    await cl.Message(content=response_message.content).send()
+                    history.append({"role": "assistant", "content": response_message.content})
+                    cl.user_session.set("message_history", history)
+                    logger.info("Conversation completed successfully")
+                else:
+                    # No content, send default completion message
+                    default_msg = "I've completed the requested actions."
+                    await cl.Message(content=default_msg).send()
+                    history.append({"role": "assistant", "content": default_msg})
+                    cl.user_session.set("message_history", history)
+                    logger.info("Conversation completed with default message")
+                break  # Exit the conversation loop
+                
+        except Exception as e:
+            logger.error(f"Error in conversation iteration {iteration}: {e}", exc_info=True)
+            await cl.Message(
+                content=f"An error occurred during tool execution: {e}"
+            ).send()
+            break
+    
+    if iteration >= max_iterations:
+        logger.warning(f"Reached maximum iterations ({max_iterations})")
+        await cl.Message(
+            content="I've reached the maximum number of tool calls for this request. Please try asking your question again if you need more assistance."
+        ).send()
+
 @cl.on_message
 async def on_message(message: cl.Message):
     """Handle incoming messages with proper logging and error handling"""
     try:
         # Log incoming message (be careful with PII)
         logger.info(f"Received message from user (length: {len(message.content)} chars)")
-        
-        # Get message history from session
-        message_history = cl.user_session.get("message_history")
-        message_history.append({"role": "user", "content": message.content})
-        
-        # Log API call attempt
-        logger.info("Making OpenAI API call...")
         start_time = datetime.now()
         
-        mcp_tools = cl.user_session.get("mcp_tools", {})
-        all_tools = [tool for connection_tools in mcp_tools.values() for tool in connection_tools]
+        # Get message history from session
+        history = cl.user_session.get("message_history")
+        history.append({"role": "user", "content": message.content})
         
-        # Convert MCP tools to OpenAI format
-        openai_tools = []
-        for tool in all_tools:
-            openai_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool["description"],
-                    "parameters": tool.get("input_schema", {})
-                }
-            }
-            openai_tools.append(openai_tool)
-
-        # Create message for streaming response
-        msg = cl.Message(content="")
-        
-        # Prepare API call parameters
-        api_call_params = {
-            "messages": message_history, 
-            "stream": True,
-            **settings
-        }
-        
-        # Only add tools if we have any
-        if openai_tools:
-            api_call_params["tools"] = openai_tools
-        
-        # Make streaming API call
-        stream = await client.chat.completions.create(**api_call_params)
-        
-        # Handle streaming response with tool calls
-        tool_calls = {}
-        current_tool_call_id = None
-        
-        async for part in stream:
-            # Handle text content
-            if content := part.choices[0].delta.content:
-                await msg.stream_token(content)
+        async with cl.Step(name="Thinking", type="llm") as thinking_step:
+            thinking_step.input = message.content
             
-            # Handle tool calls
-            if tool_calls_delta := part.choices[0].delta.tool_calls:
-                for tool_call in tool_calls_delta:
-                    if tool_call.id:
-                        # New tool call
-                        current_tool_call_id = tool_call.id
-                        tool_calls[current_tool_call_id] = {
-                            "id": tool_call.id,
-                            "type": tool_call.type,
-                            "function": {
-                                "name": tool_call.function.name if tool_call.function.name else "",
-                                "arguments": tool_call.function.arguments if tool_call.function.arguments else ""
-                            }
-                        }
-                    else:
-                        # Continue existing tool call
-                        if current_tool_call_id and tool_call.function.arguments:
-                            tool_calls[current_tool_call_id]["function"]["arguments"] += tool_call.function.arguments
-        
-        # Update message history with assistant response
-        assistant_message = {"role": "assistant", "content": msg.content}
-        
-        # If we have tool calls, add them to the message and execute
-        if tool_calls:
-            assistant_message["tool_calls"] = list(tool_calls.values())
-            message_history.append(assistant_message)
+            # Aggregate all available tools
+            all_mcp_tools = cl.user_session.get("mcp_tools", {})
+            aggregated_tools = [
+                tool for conn_tools in all_mcp_tools.values() for tool in conn_tools
+            ]
             
-            # Execute each tool call
-            for tool_call in tool_calls.values():
-                try:
-                    logger.info(f"Executing tool: {tool_call['function']['name']}")
-                    
-                    # Parse arguments
-                    import json
-                    tool_args = json.loads(tool_call["function"]["arguments"])
-                    
-                    # Create a tool use object for the call_tool function
-                    class ToolUse:
-                        def __init__(self, name, input_data):
-                            self.name = name
-                            self.input = input_data
-                    
-                    tool_use = ToolUse(tool_call["function"]["name"], tool_args)
-                    
-                    # Call the tool
-                    tool_result = await call_tool(tool_use)
-                    
-                    # Check if the tool result indicates an error
-                    is_error = False
-                    result_content = str(tool_result)
-                    
-                    # Handle MCP result format
-                    if hasattr(tool_result, 'isError') and tool_result.isError:
-                        is_error = True
-                        logger.warning(f"Tool {tool_call['function']['name']} returned error: {result_content}")
-                    elif "Error:" in result_content or "net::ERR" in result_content:
-                        is_error = True
-                        logger.warning(f"Tool {tool_call['function']['name']} failed: {result_content}")
-                    else:
-                        logger.info(f"Tool {tool_call['function']['name']} executed successfully")
-                    
-                    # Add tool result to message history
-                    tool_message = {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": result_content
-                    }
-                    message_history.append(tool_message)
-                    
-                    # Show appropriate user message
-                    if is_error:
-                        await cl.Message(content=f"⚠️ Tool '{tool_call['function']['name']}' encountered an error").send()
-                    else:
-                        await cl.Message(content=f"🔧 Tool '{tool_call['function']['name']}' executed successfully").send()
-                    
-                except Exception as e:
-                    logger.error(f"Error executing tool {tool_call['function']['name']}: {str(e)}")
-                    # Add error result to message history
-                    error_message = {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "content": f"Error: {str(e)}"
-                    }
-                    message_history.append(error_message)
-                    await cl.Message(content=f"❌ Tool '{tool_call['function']['name']}' failed with exception").send()
+            logger.info(f"Available tools: {len(aggregated_tools)} from {len(all_mcp_tools)} connections")
             
-            # Make another API call to get the final response (keep tools available for additional calls)
-            logger.info("Making follow-up API call after tool execution...")
-            follow_up_stream = await client.chat.completions.create(
-                messages=message_history,
-                stream=True,
-                tools=openai_tools if openai_tools else None,  # Keep tools available
-                **settings
+            # Make initial API call
+            response = await client.chat.completions.create(
+                model=settings["model"],
+                messages=history,
+                tools=aggregated_tools if aggregated_tools else None,
+                tool_choice="auto" if aggregated_tools else None,
+                temperature=settings["temperature"],
+                max_tokens=settings["max_tokens"]
             )
+            response_message = response.choices[0].message
+            thinking_step.output = response_message
+        
+        if response_message.tool_calls:
+            logger.info(f"Initial response includes {len(response_message.tool_calls)} tool call(s)")
             
-            # Handle potential additional tool calls in the follow-up
-            follow_up_tool_calls = {}
-            follow_up_current_tool_call_id = None
+            # Add assistant message with tool calls to history
+            history.append({
+                "role": "assistant",
+                "content": response_message.content,
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments,
+                        },
+                    }
+                    for tool_call in response_message.tool_calls
+                ],
+            })
             
-            # Stream the final response
-            final_msg = cl.Message(content="")
-            async for part in follow_up_stream:
-                # Handle text content
-                if content := part.choices[0].delta.content:
-                    await final_msg.stream_token(content)
-                
-                # Handle additional tool calls
-                if tool_calls_delta := part.choices[0].delta.tool_calls:
-                    for tool_call in tool_calls_delta:
-                        if tool_call.id:
-                            # New tool call
-                            follow_up_current_tool_call_id = tool_call.id
-                            follow_up_tool_calls[follow_up_current_tool_call_id] = {
-                                "id": tool_call.id,
-                                "type": tool_call.type,
-                                "function": {
-                                    "name": tool_call.function.name if tool_call.function.name else "",
-                                    "arguments": tool_call.function.arguments if tool_call.function.arguments else ""
-                                }
-                            }
-                        else:
-                            # Continue existing tool call
-                            if follow_up_current_tool_call_id and tool_call.function.arguments:
-                                follow_up_tool_calls[follow_up_current_tool_call_id]["function"]["arguments"] += tool_call.function.arguments
+            cl.user_session.set("message_history", history)
             
-            # If there are additional tool calls, execute them recursively
-            if follow_up_tool_calls:
-                logger.info(f"Processing {len(follow_up_tool_calls)} additional tool call(s)")
-                # Add assistant message with new tool calls
-                assistant_follow_up = {"role": "assistant", "content": final_msg.content, "tool_calls": list(follow_up_tool_calls.values())}
-                message_history.append(assistant_follow_up)
+            # Execute all tool calls
+            for tool_call in response_message.tool_calls:
+                tool_result_text, _ = await execute_mcp_tool(tool_call, all_mcp_tools)
                 
-                # Execute additional tools (similar logic as before)
-                for tool_call in follow_up_tool_calls.values():
-                    try:
-                        logger.info(f"Executing additional tool: {tool_call['function']['name']}")
-                        tool_args = json.loads(tool_call["function"]["arguments"])
-                        tool_use = ToolUse(tool_call["function"]["name"], tool_args)
-                        tool_result = await call_tool(tool_use)
-                        
-                        # Check for errors
-                        is_error = False
-                        result_content = str(tool_result)
-                        if hasattr(tool_result, 'isError') and tool_result.isError:
-                            is_error = True
-                            logger.warning(f"Additional tool {tool_call['function']['name']} returned error")
-                        
-                        tool_message = {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "content": result_content
-                        }
-                        message_history.append(tool_message)
-                        
-                        if is_error:
-                            await cl.Message(content=f"⚠️ Additional tool '{tool_call['function']['name']}' encountered an error").send()
-                        else:
-                            await cl.Message(content=f"🔧 Additional tool '{tool_call['function']['name']}' executed successfully").send()
-                        
-                    except Exception as e:
-                        logger.error(f"Error executing additional tool {tool_call['function']['name']}: {str(e)}")
-                        error_message = {
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "content": f"Error: {str(e)}"
-                        }
-                        message_history.append(error_message)
+                # Add tool result to history
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str(tool_result_text),
+                })
                 
-                # Final API call for the ultimate response
-                logger.info("Making final API call after additional tool execution...")
-                final_stream = await client.chat.completions.create(
-                    messages=message_history,
-                    stream=True,
-                    **{k: v for k, v in settings.items()}  # No more tools this time
-                )
-                
-                ultimate_msg = cl.Message(content="")
-                async for part in final_stream:
-                    if content := part.choices[0].delta.content:
-                        await ultimate_msg.stream_token(content)
-                
-                message_history.append({"role": "assistant", "content": ultimate_msg.content})
-                await ultimate_msg.update()
-            else:
-                # No additional tool calls, just regular response
-                message_history.append({"role": "assistant", "content": final_msg.content})
-                await final_msg.update()
+                cl.user_session.set("message_history", history)
+            
+            # Continue conversation to get final response
+            await continue_conversation(history, aggregated_tools)
+            
         else:
-            # No tool calls, just add the regular response
-            message_history.append(assistant_message)
+            # No tool calls, just send the response
+            if response_message.content:
+                await cl.Message(content=response_message.content).send()
+                history.append({"role": "assistant", "content": response_message.content})
+                cl.user_session.set("message_history", history)
+                logger.info("Sent direct response without tools")
         
-        await msg.update()
-        
-        # Log successful API call
+        # Log successful completion
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
-        logger.info(f"OpenAI API call successful (duration: {duration:.2f}s)")
-        if tool_calls:
-            logger.info(f"Executed {len(tool_calls)} tool(s)")
-        logger.info(f"Response sent (length: {len(msg.content)} chars)")
+        logger.info(f"Message processed successfully (duration: {duration:.2f}s)")
         
     except Exception as e:
         # Log the error
@@ -356,95 +424,3 @@ async def on_message(message: cl.Message):
 async def on_chat_end():
     """Log when a chat session ends"""
     logger.info("Chat session ended")
-
-@cl.on_mcp_connect
-async def on_mcp_connect(connection, session: ClientSession):
-    """Called when an MCP connection is established"""
-    logger.info(f"MCP connection established: {connection.name}")
-    
-    try:
-        # List available tools
-        result = await session.list_tools()
-        
-        # Process tool metadata
-        tools = [{
-            "name": t.name,
-            "description": t.description,
-            "input_schema": t.inputSchema,
-        } for t in result.tools]
-        
-        # Store tools for later use
-        mcp_tools = cl.user_session.get("mcp_tools", {})
-        mcp_tools[connection.name] = tools
-        cl.user_session.set("mcp_tools", mcp_tools)
-        
-        logger.info(f"Loaded {len(tools)} tools from {connection.name}: {[t['name'] for t in tools]}")
-        
-    except Exception as e:
-        logger.error(f"Error connecting to MCP {connection.name}: {str(e)}", exc_info=True)
-
-def find_mcp_for_tool(tool_name):
-    """Find which MCP connection provides a specific tool"""
-    mcp_tools = cl.user_session.get("mcp_tools", {})
-    for connection_name, tools in mcp_tools.items():
-        for tool in tools:
-            if tool["name"] == tool_name:
-                return connection_name
-    return None
-
-@cl.step(type="tool") 
-async def call_tool(tool_use):
-    """Call an MCP tool with proper error handling"""
-    try:
-        tool_name = tool_use.name
-        tool_input = tool_use.input
-        
-        logger.info(f"Calling MCP tool: {tool_name}")
-        print(f"Calling tool: {tool_name} with input: {tool_input}")
-        
-        # Find appropriate MCP connection for this tool
-        mcp_name = find_mcp_for_tool(tool_name)
-        if not mcp_name:
-            raise ValueError(f"No MCP connection found for tool: {tool_name}")
-        
-        # Get the MCP session
-        mcp_session, _ = cl.context.session.mcp_sessions.get(mcp_name)
-        
-        # Call the tool
-        result = await mcp_session.call_tool(tool_name, tool_input)
-        
-        print(f"Result: {result}")
-        
-        # Log based on whether it's an error or success
-        if hasattr(result, 'isError') and result.isError:
-            logger.warning(f"MCP tool {tool_name} returned error result")
-        else:
-            logger.info(f"MCP tool {tool_name} executed successfully")
-            
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error calling MCP tool {tool_name}: {str(e)}", exc_info=True)
-        # Return a structured error that the caller can detect
-        class ErrorResult:
-            def __init__(self, error_msg):
-                self.isError = True
-                self.content = [{"type": "text", "text": f"Error: {error_msg}"}]
-            
-            def __str__(self):
-                return f"Error: {self.content[0]['text'] if self.content else 'Unknown error'}"
-        
-        return ErrorResult(str(e))
-    
-@cl.on_mcp_disconnect
-async def on_mcp_disconnect(name: str, session: ClientSession):
-    """Called when an MCP connection is terminated"""
-    logger.info(f"MCP connection disconnected: {name}")
-    
-    # Remove tools from session
-    mcp_tools = cl.user_session.get("mcp_tools", {})
-    if name in mcp_tools:
-        removed_tools = len(mcp_tools[name])
-        del mcp_tools[name]
-        cl.user_session.set("mcp_tools", mcp_tools)
-        logger.info(f"Removed {removed_tools} tools from disconnected MCP: {name}")
